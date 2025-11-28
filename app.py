@@ -8,7 +8,7 @@ import urllib.parse
 import pickle
 
 # -------------------------------------------------------
-# UI CONFIG
+# 1. UI CONFIGURATION
 # -------------------------------------------------------
 st.set_page_config(
     page_title="AI Mood Music Recommender",
@@ -16,12 +16,13 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# SIMPLE DARK THEME
+# Dark Theme & Button Styles
 st.markdown(
     """
     <style>
     body { background-color: #0f1117; color: white; }
     .main { background-color: #0f1117; }
+    .stButton>button { width: 100%; border-radius: 8px; font-weight: bold; }
     .play-btn {
         background-color: #1db954;
         padding: 8px 14px;
@@ -30,6 +31,7 @@ st.markdown(
         text-decoration: none;
         font-size: 13px;
         margin-right: 8px;
+        display: inline-block;
     }
     .yt-btn {
         background-color: #ff0000;
@@ -38,6 +40,7 @@ st.markdown(
         color: white;
         text-decoration: none;
         font-size: 13px;
+        display: inline-block;
     }
     </style>
     """,
@@ -45,7 +48,7 @@ st.markdown(
 )
 
 # -------------------------------------------------------
-# FILE PATHS
+# 2. CONSTANTS & PATHS
 # -------------------------------------------------------
 MODEL_ONNX_PATH = "emotion_cnn.onnx"
 DATA_PATH = "Hindi_songs_clean.csv"
@@ -53,8 +56,11 @@ POSTER_IMAGE = "songs_cover.jpg"
 SIM_PATH = "similarity.npy"
 IDX_PATH = "index_mapping.pkl"
 
+# Haar Cascade for Face Detection
+HAAR_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+
 # -------------------------------------------------------
-# LOAD DATASET
+# 3. DATA LOADING
 # -------------------------------------------------------
 @st.cache_data
 def load_dataset():
@@ -65,37 +71,47 @@ def load_dataset():
 df = load_dataset()
 
 if df is None:
-    st.error("Missing dataset: Hindi_songs_clean.csv")
+    st.error(f"❌ Missing dataset: {DATA_PATH}")
     st.stop()
 
 if 'mood' not in df.columns:
-    st.error("Dataset missing 'mood' column.")
+    st.error("❌ Dataset is missing the 'mood' column.")
     st.stop()
 
 # -------------------------------------------------------
-# LOAD ONNX MODEL
+# 4. MODEL LOADING
 # -------------------------------------------------------
-session = ort.InferenceSession(MODEL_ONNX_PATH, providers=['CPUExecutionProvider'])
-input_name = session.get_inputs()[0].name
+# Load ONNX Model
+try:
+    session = ort.InferenceSession(MODEL_ONNX_PATH, providers=['CPUExecutionProvider'])
+    input_name = session.get_inputs()[0].name
+except Exception as e:
+    st.error(f"❌ Error loading ONNX model: {e}")
+    st.stop()
 
-# -------------------------------------------------------
-# LOAD CF ARTIFACTS
-# -------------------------------------------------------
+# Load Face Detector
+face_cascade = cv2.CascadeClassifier(HAAR_PATH)
+
+# Load Collaborative Filtering Artifacts
 @st.cache_resource
 def load_cf():
     if not os.path.exists(SIM_PATH) or not os.path.exists(IDX_PATH):
         return None, None
-    similarity = np.load(SIM_PATH, mmap_mode="r")
-    with open(IDX_PATH, "rb") as f:
-        index_mapping = pickle.load(f)
-    return similarity, index_mapping
+    try:
+        similarity = np.load(SIM_PATH, mmap_mode="r")
+        with open(IDX_PATH, "rb") as f:
+            index_mapping = pickle.load(f)
+        return similarity, index_mapping
+    except Exception:
+        return None, None
 
 similarity, index_mapping = load_cf()
 
 # -------------------------------------------------------
-# EMOTION + MOOD MAP
+# 5. MAPPINGS
 # -------------------------------------------------------
-EMOTIONS = ['angry','disgust','fear','happy','sad','surprise','neutral']
+EMOTIONS = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
+
 MOOD_MAP = {
     "angry": "Energetic",
     "disgust": "Sad",
@@ -105,6 +121,7 @@ MOOD_MAP = {
     "surprise": "Surprise",
     "neutral": "Calm"
 }
+
 MOOD_EMOJI = {
     "Happy": "🙂",
     "Energetic": "🔥",
@@ -114,62 +131,86 @@ MOOD_EMOJI = {
 }
 
 # -------------------------------------------------------
-# FACE PROCESSING
+# 6. CORE FUNCTIONS (PREPROCESS & PREDICT)
 # -------------------------------------------------------
-haar_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-face_cascade = cv2.CascadeClassifier(haar_path)
+
+def softmax(x):
+    """Compute softmax values for each set of scores in x."""
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum()
 
 def preprocess_face(img_bytes):
-    arr = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    face = cv2.resize(gray, (48,48)) / 255.0
-    return face.reshape(1,48,48,1).astype(np.float32)
+    """
+    Decodes image, finds face, crops it, and resizes to 48x48.
+    Returns None if no face is found.
+    """
+    try:
+        # Decode
+        arr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Detect Faces
+        faces = face_cascade.detectMultiScale(
+            gray, 
+            scaleFactor=1.1, 
+            minNeighbors=5, 
+            minSize=(30, 30)
+        )
+        
+        # If no face, return None
+        if len(faces) == 0:
+            return None
+
+        # Crop Largest Face
+        x, y, w, h = faces[0]
+        face_img = gray[y:y+h, x:x+w]
+        
+        # Resize & Normalize
+        resized = cv2.resize(face_img, (48, 48))
+        normalized = resized / 255.0
+        
+        return normalized.reshape(1, 48, 48, 1).astype(np.float32)
+
+    except Exception as e:
+        print(f"Error in preprocessing: {e}")
+        return None
 
 def predict_emotion(img48):
+    """Runs inference on the cropped 48x48 face. Always returns a result."""
+    # Run the model
     preds = session.run(None, {input_name: img48})[0][0]
+    
+    # Convert Logits to Probability (Softmax)
+    probs = softmax(preds)
 
-    # Soft penalty for surprise (not too strong)
-    preds[EMOTIONS.index('surprise')] *= 0.85
+    # Soft penalty for surprise (optional heuristic to reduce false positives)
+    probs[EMOTIONS.index('surprise')] *= 0.85
 
-    # Get top two predictions
-    sorted_idx = preds.argsort()[::-1]
+    # Get top prediction
+    sorted_idx = probs.argsort()[::-1]
     top1 = sorted_idx[0]
-    top2 = sorted_idx[1]
-
-    top1_prob = preds[top1]
-    top2_prob = preds[top2]
-
-    # 1️⃣ Very low confidence → show "Unknown" instead of Neutral/Calm
-    if top1_prob < 0.40:
-        return "unknown"
-
-    # 2️⃣ If Surprise barely wins → take 2nd best
-    if EMOTIONS[top1] == "surprise" and (top1_prob - top2_prob) < 0.10:
-        return EMOTIONS[top2]
-
-    # 3️⃣ Normal prediction
-    return EMOTIONS[top1]
-
-
+    
+    # We always return the top emotion, even if confidence is low.
+    prediction = EMOTIONS[top1]
+    score = probs[top1]
+    
+    return prediction, score, probs
 
 # -------------------------------------------------------
-# MOOD PLAYLIST
+# 7. RECOMMENDATION LOGIC
 # -------------------------------------------------------
+
 def mood_recommend(mood, top_n=10):
     mood_df = df[df['mood'].str.lower() == mood.lower()]
     if mood_df.empty:
         return mood_df
     return mood_df.sample(min(top_n, len(mood_df)))
 
-# -------------------------------------------------------
-# COLLABORATIVE FILTERING RECOMMENDER
-# -------------------------------------------------------
 def recommend_cf(seed_song, top_n=10):
     if similarity is None or index_mapping is None:
         return pd.DataFrame()
 
-    # Normalize
     seed_norm = seed_song.strip().lower()
     mapped = {k.strip().lower(): v for k, v in index_mapping["song_to_index"].items()}
 
@@ -180,6 +221,7 @@ def recommend_cf(seed_song, top_n=10):
     sims = similarity[idx]
 
     similar_indices = sims.argsort()[::-1]
+    # Skip the first one (it's the song itself)
     similar_indices = [i for i in similar_indices if i != idx][:top_n]
 
     inv_map = {v: k for k, v in index_mapping["song_to_index"].items()}
@@ -187,9 +229,6 @@ def recommend_cf(seed_song, top_n=10):
 
     return df[df['song_name'].str.lower().isin([s.lower() for s in songs])].reset_index(drop=True)
 
-# -------------------------------------------------------
-# SONG CARD
-# -------------------------------------------------------
 def render_song_card(row):
     song = row['song_name']
     artist = row['singer']
@@ -200,109 +239,132 @@ def render_song_card(row):
     youtube_url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(song + " " + artist)
 
     with st.container():
-        st.image(POSTER_IMAGE, use_column_width=True)
+        if os.path.exists(POSTER_IMAGE):
+            st.image(POSTER_IMAGE, use_column_width=True)
+        else:
+            st.write("🎵") # Fallback if image missing
+            
         st.markdown(f"### {emoji} {song}")
         st.markdown(f"**{artist}**")
-        st.markdown(f"**Mood:** {mood}")
+        st.caption(f"Mood: {mood}")
         st.markdown(
             f"""
-            <a href="{spotify_url}" target="_blank" class="play-btn">Spotify ▶️</a>
-            <a href="{youtube_url}" target="_blank" class="yt-btn">YouTube ▶️</a>
+            <a href="{spotify_url}" target="_blank" class="play-btn">Spotify</a>
+            <a href="{youtube_url}" target="_blank" class="yt-btn">YouTube</a>
             """,
             unsafe_allow_html=True
         )
 
 # -------------------------------------------------------
-# SIDEBAR NAVIGATION
+# 8. MAIN APP NAVIGATION
 # -------------------------------------------------------
-st.sidebar.title("Menu")
-page = st.sidebar.radio("", ["Mood Playlist", "Search Songs"])
+st.sidebar.title("🎵 Mood Tuner")
+page = st.sidebar.radio("Navigate", ["Mood Playlist (Camera)", "Advanced Search"])
 
-# -------------------------------------------------------
-# PAGE 1: Mood Playlist
-# -------------------------------------------------------
-if page == "Mood Playlist":
-    st.header("📸 Capture Mood")
-    cam = st.camera_input("Capture your face")
+# --- PAGE 1: CAMERA & MOOD ---
+if page == "Mood Playlist (Camera)":
+    st.header("📸 How are you feeling?")
+    st.write("Take a selfie, and we'll play music that matches your mood.")
+    
+    cam = st.camera_input("Look into the camera")
 
-    if cam and st.button("Analyze Mood"):
-        face = preprocess_face(cam.getvalue())
-        emotion = predict_emotion(face)
-        mood = MOOD_MAP.get(emotion, "Calm")
-        emoji = MOOD_EMOJI.get(mood, "🎵")
+    if cam:
+        if st.button("Analyze Mood", type="primary"):
+            with st.spinner("Analyzing your face..."):
+                # 1. Preprocess (Crop Face)
+                face = preprocess_face(cam.getvalue())
 
-        st.markdown(f"<h2>{emoji} Detected Mood: {mood}</h2>", unsafe_allow_html=True)
+                # 2. Check if face found
+                if face is None:
+                    st.error("⚠️ No face detected! Please move closer or adjust lighting.")
+                else:
+                    # 3. Predict (Now returns score and all probs)
+                    emotion, score, probs = predict_emotion(face)
+                    
+                    # 4. Map to Mood
+                    mood = MOOD_MAP.get(emotion, "Calm")
+                    emoji = MOOD_EMOJI.get(mood, "🎵")
 
-        recs = mood_recommend(mood, 10)
+                    # Display Result
+                    st.success(f"Detected: **{emotion.title()}** ({int(score*100)}% confidence)")
+                    st.markdown(f"<h1 style='text-align:center; font-size:60px;'>{emoji} {mood}</h1>", unsafe_allow_html=True)
 
-        cols = st.columns(2)
-        idx = 0
-        for _, row in recs.iterrows():
-            with cols[idx % 2]:
-                render_song_card(row)
-            idx += 1
+                    # --- SHOW DEBUG INFO ---
+                    with st.expander("📊 See Emotion Details (Debug Info)"):
+                        st.write("Model Probabilities:")
+                        # Create a nice dataframe for the chart
+                        chart_data = pd.DataFrame(
+                            {"Emotion": EMOTIONS, "Probability": probs}
+                        ).set_index("Emotion")
+                        st.bar_chart(chart_data)
 
-# -------------------------------------------------------
-# PAGE 2: ADVANCED SEARCH + CF
-# -------------------------------------------------------
+                    # 5. Recommend Songs
+                    recs = mood_recommend(mood, 8)
+                    
+                    st.markdown("---")
+                    if recs.empty:
+                        st.warning(f"No songs found for mood: {mood}")
+                    else:
+                        cols = st.columns(4) # 4 Columns for cleaner look
+                        idx = 0
+                        for _, row in recs.iterrows():
+                            with cols[idx % 4]:
+                                render_song_card(row)
+                            idx += 1
+
+# --- PAGE 2: SEARCH & FILTER ---
 else:
-    st.header("🔍 Advanced Song Search")
+    st.header("🔍 Discover Music")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        name_query = st.text_input("Search Song")
+    with col2:
+        artist_list = sorted(df['singer'].dropna().unique().tolist())
+        artist_filter = st.selectbox("Artist", ["All"] + artist_list)
+    with col3:
+        mood_list = sorted(df['mood'].dropna().unique().tolist())
+        mood_filter = st.selectbox("Mood", ["All"] + mood_list)
 
-    # --- Search Inputs ---
-    name_query = st.text_input("Search by Song Name")
-
-    artist_list = sorted(df['singer'].dropna().unique().tolist())
-    artist_filter = st.selectbox("Filter by Artist", ["All"] + artist_list)
-
-    mood_list = sorted(df['mood'].dropna().unique().tolist())
-    mood_filter = st.selectbox("Filter by Mood", ["All"] + mood_list)
-
-    # Optional year filter
-    if 'year' in df.columns:
-        year_list = sorted(df['year'].dropna().unique().tolist())
-        year_filter = st.selectbox("Filter by Year", ["All"] + list(map(str, year_list)))
-    else:
-        year_filter = "All"
-
-    # --- Apply Filters ---
+    # Apply Filters
     filtered = df.copy()
 
     if name_query:
         filtered = filtered[filtered['song_name'].str.contains(name_query, case=False, na=False)]
-
     if artist_filter != "All":
         filtered = filtered[filtered['singer'] == artist_filter]
-
     if mood_filter != "All":
         filtered = filtered[filtered['mood'] == mood_filter]
 
-    if year_filter != "All":
-        filtered = filtered[filtered['year'].astype(str) == year_filter]
-
-    # --- Display Results ---
+    st.markdown("---")
+    
     if filtered.empty:
-        st.warning("No songs found with selected filters.")
+        st.info("No songs found matching your criteria.")
     else:
-        st.write(f"### Results: {len(filtered)} songs found")
-
-        cols = st.columns(2)
+        st.write(f"Found **{len(filtered)}** songs")
+        
+        cols = st.columns(4)
         idx = 0
+        
+        # Limit to 20 to prevent lag
         for _, row in filtered.head(20).iterrows():
-            with cols[idx % 2]:
+            with cols[idx % 4]:
                 render_song_card(row)
-
+                
                 # CF Button
-                if st.button(f"Find Similar to {row['song_name']}", key=row['song_name']):
-                    st.subheader(f"🔥 Similar Songs to '{row['song_name']}'")
-                    recs = recommend_cf(row['song_name'], 10)
-
-                    if recs.empty:
-                        st.warning("No similar songs found.")
+                if st.button(f"Similar 🎶", key=f"sim_{row.name}"):
+                    st.toast(f"Finding songs like {row['song_name']}...")
+                    recs = recommend_cf(row['song_name'], 4)
+                    if not recs.empty:
+                        st.write("---")
+                        st.write(f"**Similar to {row['song_name']}:**")
+                        s_cols = st.columns(4)
+                        s_idx = 0
+                        for _, s_row in recs.iterrows():
+                            with s_cols[s_idx % 4]:
+                                render_song_card(s_row)
+                            s_idx += 1
                     else:
-                        sub_cols = st.columns(2)
-                        sub_idx = 0
-                        for _, rec_row in recs.iterrows():
-                            with sub_cols[sub_idx % 2]:
-                                render_song_card(rec_row)
-                            sub_idx += 1
+                        st.warning("No similar songs data found.")
             idx += 1
